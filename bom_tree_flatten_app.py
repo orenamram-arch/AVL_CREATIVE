@@ -30,7 +30,7 @@ INFO_COLS_PRIORITY = [
     "ID", "REV", "CN", "DESCRIPTION", "UOM", "TYPE", "STATUS",
     "OWNER", "GROUP", "BUY_STATUS", "PRD_TYPE", "CATEGORY",
 ]
-REQUIRED_COLS = {"LEVEL", "ID", "NEXT_ASSY"}
+REQUIRED_COLS = {"LEVEL", "ID"}
 
 # Different ERP exports spell the same column differently. Map known
 # variants to the canonical name the rest of the app expects.
@@ -91,41 +91,151 @@ def load_sheet_as_table(raw: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def flatten_single_tree(block: pd.DataFrame, qty_col: str):
-    comps = block[pd.to_numeric(block["LEVEL"], errors="coerce") > 0].copy()
+def parse_tree_nodes(block: pd.DataFrame, qty_col: str):
+    """
+    Parse the raw indented BOM export into an actual tree of row-nodes,
+    using LEVEL + row order (the same signal any indented-tree viewer
+    uses) rather than matching by ID text. This means a sub-assembly used
+    under two different parents becomes two distinct node objects — each
+    with its own children and its own quantities exactly as the source
+    file lists them, with nothing summed or blended together.
+    """
+    block = block.reset_index(drop=True)
+    nodes = []
+    stack = []  # (level, node_idx)
+    for i in range(len(block)):
+        row = block.iloc[i]
+        lvl_raw = pd.to_numeric(row.get("LEVEL"), errors="coerce")
+        if pd.isna(lvl_raw):
+            continue
+        lvl = int(lvl_raw)
+        while stack and stack[-1][0] >= lvl:
+            stack.pop()
+        parent_idx = stack[-1][1] if stack else None
+        qty_val = pd.to_numeric(row.get(qty_col), errors="coerce") if qty_col in row.index else None
+        seq_val = pd.to_numeric(row.get("SEQ"), errors="coerce") if "SEQ" in row.index else None
+        node = {
+            "idx": len(nodes),
+            "id": str(row.get("ID")),
+            "level": lvl,
+            "parent_idx": parent_idx,
+            "qty": qty_val,
+            "seq": seq_val,
+            "row": row,
+        }
+        nodes.append(node)
+        stack.append((lvl, node["idx"]))
+    return nodes
 
-    if qty_col not in comps.columns:
+
+def flatten_single_tree(block: pd.DataFrame, qty_col: str):
+    if qty_col not in block.columns:
         raise ValueError(f"Quantity column '{qty_col}' not found in source data.")
 
-    comps[qty_col] = pd.to_numeric(comps[qty_col], errors="coerce").fillna(0)
-    comps["NEXT_ASSY"] = comps["NEXT_ASSY"].astype(str)
-    comps["ID"] = comps["ID"].astype(str)
+    nodes = parse_tree_nodes(block, qty_col)
+    if not nodes:
+        raise ValueError("No valid LEVEL/ID rows found in this tree block.")
 
-    info_cols = [c for c in INFO_COLS_PRIORITY if c in comps.columns]
+    children_of = {}
+    for n in nodes:
+        if n["parent_idx"] is not None:
+            children_of.setdefault(n["parent_idx"], []).append(n["idx"])
+    for parent_idx, kids in children_of.items():
+        children_of[parent_idx] = sorted(
+            kids, key=lambda idx: (nodes[idx]["seq"] if pd.notna(nodes[idx]["seq"]) else 0, nodes[idx]["id"])
+        )
 
-    agg = (
-        comps.groupby(["ID", "NEXT_ASSY"], dropna=False)[qty_col]
-        .sum()
-        .reset_index()
-    )
+    assembly_idxs = list(children_of.keys())  # nodes that have >=1 child
 
-    pivot = agg.pivot(index="ID", columns="NEXT_ASSY", values=qty_col)
-    parent_ids = list(pivot.columns)
+    # How many distinct occurrence-nodes share the same assembly ID? Only
+    # those need a disambiguating column label; a uniquely-placed assembly
+    # keeps the simple "QPA_in_<id> (L<level>)" label as before.
+    id_occurrence_count = {}
+    for idx in assembly_idxs:
+        aid = nodes[idx]["id"]
+        id_occurrence_count[aid] = id_occurrence_count.get(aid, 0) + 1
 
-    item_info = comps.drop_duplicates(subset="ID", keep="first")[info_cols].set_index("ID")
-    usage_count = comps.groupby("ID")["NEXT_ASSY"].nunique().rename("USED_IN_N_ASSEMBLIES")
+    labels, used_labels = {}, set()
+    for idx in assembly_idxs:
+        n = nodes[idx]
+        if id_occurrence_count[n["id"]] == 1:
+            label = f"QPA_in_{n['id']} (L{n['level']})"
+        else:
+            parent_id = nodes[n["parent_idx"]]["id"] if n["parent_idx"] is not None else "ROOT"
+            label = f"QPA_in_{n['id']} [under {parent_id}] (L{n['level']})"
+        final = label
+        i = 2
+        while final in used_labels:
+            final = f"{label} #{i}"
+            i += 1
+        used_labels.add(final)
+        labels[idx] = final
 
-    flat = item_info.join(usage_count).join(pivot).reset_index()
+    # Depth-first, pre-order walk of the REAL tree: root, then each direct
+    # child assembly immediately followed by its own children, recursively.
+    order_idx = []
 
-    qpa_rename = {p: f"QPA_in_{p}" for p in parent_ids}
-    flat = flat.rename(columns=qpa_rename)
+    def dfs(node_idx):
+        if node_idx in children_of:
+            order_idx.append(node_idx)
+        for c in children_of.get(node_idx, []):
+            dfs(c)
+
+    dfs(0)  # nodes[0] is always this block's LEVEL-0 root
+
+    # Per-occurrence child quantities — no cross-occurrence summing. If the
+    # exact same child ID appears twice under the EXACT same occurrence
+    # (duplicate SEQ under one specific parent instance), those are summed;
+    # different occurrences of the parent are never mixed together.
+    child_qty = {}
+    for idx in assembly_idxs:
+        d = {}
+        for c_idx in children_of[idx]:
+            c = nodes[c_idx]
+            q = c["qty"] if c["qty"] is not None and pd.notna(c["qty"]) else 0
+            d[c["id"]] = d.get(c["id"], 0) + q
+        child_qty[idx] = d
+
+    info_cols = [c for c in INFO_COLS_PRIORITY if c in block.columns]
+    part_first_row = {}
+    for n in nodes:
+        if n["level"] > 0 and n["id"] not in part_first_row:
+            part_first_row[n["id"]] = n["row"]
+
+    all_part_ids = sorted(part_first_row.keys())
+    data_rows = []
+    for pid in all_part_ids:
+        row = part_first_row[pid]
+        rec = {c: row.get(c) for c in info_cols}
+        rec["ID"] = pid  # always the normalized string key, never the raw (possibly numeric) cell
+        data_rows.append(rec)
+    flat = pd.DataFrame(data_rows)
+
+    usage_count = [sum(1 for idx in order_idx if pid in child_qty[idx]) for pid in all_part_ids]
+    flat["USED_IN_N_ASSEMBLIES"] = usage_count
+
+    for idx in order_idx:
+        d = child_qty[idx]
+        flat[labels[idx]] = [d.get(pid, None) for pid in all_part_ids]
+
     flat = flat.sort_values("ID").reset_index(drop=True)
 
-    legend_cols = [c for c in ["ID", "DESCRIPTION", "REV"] if c in block.columns]
-    all_ids = block[legend_cols].astype(str).drop_duplicates(subset="ID")
-    legend = all_ids[all_ids["ID"].isin(parent_ids)].copy()
-    legend = legend.rename(columns={"ID": "ASSEMBLY_ID"})
-    legend = legend.sort_values("ASSEMBLY_ID").reset_index(drop=True)
+    legend_rows = []
+    for idx in order_idx:
+        n = nodes[idx]
+        row = n["row"]
+        parent_id = nodes[n["parent_idx"]]["id"] if n["parent_idx"] is not None else ""
+        legend_rows.append(
+            {
+                "LEVEL": n["level"],
+                "ASSEMBLY_ID": n["id"],
+                "DESCRIPTION": row.get("DESCRIPTION", ""),
+                "REV": row.get("REV", ""),
+                "PARENT_ID": parent_id,
+                "COLUMN_LABEL": labels[idx],
+            }
+        )
+    legend = pd.DataFrame(legend_rows)
 
     return flat, legend
 
