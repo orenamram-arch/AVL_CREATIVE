@@ -32,6 +32,33 @@ INFO_COLS_PRIORITY = [
 ]
 REQUIRED_COLS = {"LEVEL", "ID", "NEXT_ASSY"}
 
+# Different ERP exports spell the same column differently. Map known
+# variants to the canonical name the rest of the app expects.
+HEADER_ALIASES = {
+    "DESC": "DESCRIPTION",
+    "DESC.": "DESCRIPTION",
+    "DESCR": "DESCRIPTION",
+    "PART_DESCRIPTION": "DESCRIPTION",
+    "PARENT": "NEXT_ASSY",
+    "PARENT_ID": "NEXT_ASSY",
+    "NEXTASSY": "NEXT_ASSY",
+    "NEXT_ASSEMBLY": "NEXT_ASSY",
+    "PART_NUMBER": "ID",
+    "PART_NO": "ID",
+    "PN": "ID",
+    "ITEM_ID": "ID",
+    "QTY": "ORIG_QTY",
+    "QUANTITY": "ORIG_QTY",
+}
+
+
+def canonicalize_header(h) -> str:
+    """Normalize a raw header cell to the canonical column name we expect."""
+    raw = str(h).strip()
+    stripped = raw.rstrip(".").strip()
+    key = re.sub(r"\s+", "_", stripped.upper())
+    return HEADER_ALIASES.get(key, key)
+
 
 # ----------------------------------------------------------------------
 # Core logic (same engine as the standalone script)
@@ -53,11 +80,14 @@ def sanitize_sheet_name(name: str, used_names: set) -> str:
 
 
 def load_sheet_as_table(raw: pd.DataFrame) -> pd.DataFrame:
-    header = [str(h).strip() for h in raw.iloc[0].tolist()]
+    header = [canonicalize_header(h) for h in raw.iloc[0].tolist()]
     data = raw.iloc[1:].copy()
     data.columns = header
     data = data.reset_index(drop=True)
     data = data.dropna(how="all")
+    # If a canonicalization collision produced duplicate column names, keep
+    # the first occurrence of each so downstream selection stays unambiguous.
+    data = data.loc[:, ~data.columns.duplicated()]
     return data
 
 
@@ -91,7 +121,8 @@ def flatten_single_tree(block: pd.DataFrame, qty_col: str):
     flat = flat.rename(columns=qpa_rename)
     flat = flat.sort_values("ID").reset_index(drop=True)
 
-    all_ids = block[["ID", "DESCRIPTION", "REV"]].astype(str).drop_duplicates(subset="ID")
+    legend_cols = [c for c in ["ID", "DESCRIPTION", "REV"] if c in block.columns]
+    all_ids = block[legend_cols].astype(str).drop_duplicates(subset="ID")
     legend = all_ids[all_ids["ID"].isin(parent_ids)].copy()
     legend = legend.rename(columns={"ID": "ASSEMBLY_ID"})
     legend = legend.sort_values("ASSEMBLY_ID").reset_index(drop=True)
